@@ -1,0 +1,16 @@
+# dbt packages — pa-warehouse
+# Run `dbt deps` after editing to install/update.
+
+packages:
+  # Canonical dbt utility library — generic tests, cross-db macros, date_spine.
+  # Per Research A: signals stack fluency. Used in Loop 5 for cross-warehouse
+  # SQL (date_trunc, date_spine) when porting to Snowflake.
+  - package: dbt-labs/dbt_utils
+    version: [">=1.1.0", "<2.0.0"]
+
+  # Project quality evaluator — runs Loop 4 (Story 4.3.5) before publication.
+  # Best-in-class portfolio signal per r04 hunt review. Checks naming
+  # conventions, test coverage, documentation coverage, model dependencies.
+  # Add to `dbt build --select package:dbt_project_evaluator` once installed.
+  - package: dbt-labs/dbt_project_evaluator
+    version: [">=0.13.0", "<1.0.0"]
