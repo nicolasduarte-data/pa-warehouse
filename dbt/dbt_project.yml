@@ -1,7 +1,7 @@
 # dbt_project.yml — pa-warehouse
-# Per BACKLOG Story 1.3.3 — model paths + directory-level materializations
-# Story 1.3 is one of the three "portfolio senior signal" markers per Research A:
-# YAML completeness + schema tests + directory-level materializations.
+# Standard dbt-Labs project layout: three-layer architecture (raw → staging →
+# core → marts) plus directory-level materialization defaults, schema routing,
+# and snapshot configuration.
 
 name: 'pa_warehouse'
 version: '1.0.0'
@@ -11,9 +11,8 @@ config-version: 2
 # alongside this file). The actual credentials live there, never here.
 profile: 'pa_warehouse'
 
-# Standard dbt-Labs project layout. Aligns with Research A's recommendation
-# and the three-layer architecture: raw (declared as sources) → staging →
-# core → marts.
+# Standard dbt-Labs project layout. Raw is declared as sources (loaded by
+# generator/load_raw.py); staging → core → marts cascade transforms downstream.
 model-paths: ["models"]
 analysis-paths: ["analyses"]
 test-paths: ["tests"]
@@ -30,9 +29,9 @@ clean-targets:
 #
 #   staging/   → view   — cheap, no storage, always up to date
 #   core/      → table  — built once per `dbt run`, used many times by marts
-#   marts/     → view   — dashboard-facing, query latency target <3s on live
-#                         Looker Studio connection (Research A: live mode, no
-#                         100MB extract constraint)
+#   marts/     → view   — dashboard-facing, query latency target <3s on the
+#                         live Looker Studio connection (live mode, no 100MB
+#                         extract constraint)
 models:
   pa_warehouse:
     staging:
@@ -44,15 +43,21 @@ models:
     marts:
       +materialized: view
       +schema: marts
+  # Route dbt_project_evaluator's analytical models (base_*, fct_*, dim_model_*)
+  # to their own dataset so they don't pollute `raw`. Without this routing,
+  # the evaluator's 48 models land in whatever the default dataset is — caught
+  # this bug during the schema-hygiene polish pass.
+  dbt_project_evaluator:
+    +schema: dbt_project_evaluator
 
-# Snapshot config defaults — `target_schema` lives at the snapshot level per
-# Research A. See snapshots/dim_employee_snapshot.sql for the full SCD2 config.
+# Snapshot config defaults — `target_schema` lives at the snapshot level.
+# See snapshots/dim_employee_snapshot.sql for the full SCD2 config.
 snapshots:
   pa_warehouse:
     +target_schema: core
 
-# Seed config — phantom dim rows for sentinel values land here (per BACKLOG
-# Story 2.8.2). Loop 1 doesn't use seeds yet.
+# Seed config — phantom dim rows for sentinel values land here. Walking-skeleton
+# phase doesn't use seeds yet; populated as the warehouse matures.
 seeds:
   pa_warehouse:
     +schema: core

@@ -44,8 +44,14 @@ data/processed/*.csv
 # ─── OS / editor ─────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
 *.swp
 *.swo
 .idea/
 .vscode/
 *.log
+
+# ─── Internal planning / private working docs ────────────────────────
+# BACKLOG.md contains the full sprint planning with terminology specific to
+# the author's workflow. The public-facing planning doc is ROADMAP.md.
+BACKLOG.md

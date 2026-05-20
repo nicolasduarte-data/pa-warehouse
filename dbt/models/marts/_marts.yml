@@ -1,0 +1,54 @@
+version: 2
+
+# _marts.yml — schema declarations + contract enforcement for marts views.
+#
+# v_attrition_features is contract-enforced so schema drift breaks the dbt
+# build, not the downstream training notebook. This is the entire point of
+# dbt model contracts: catch type/column changes at warehouse compile time,
+# before downstream consumers (ML pipelines, BI tools, other teams) discover
+# the break.
+
+models:
+
+  - name: v_attrition_features
+    description: >
+      Employee-grain ML training input. One row per active employee at
+      `snapshot_date`, with features (tenure, performance, compa-ratio,
+      role criticality, successor count) and a binary label
+      (`voluntary_exit_label` = TRUE if the employee voluntarily exited
+      within 12 months after snapshot_date).
+      Parameterizable via dbt var `snapshot_date` (default: 12 months ago).
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: employee_id
+        description: "Stable employee key. PK of the snapshot row (one row per employee at snapshot_date)."
+        data_type: string
+        constraints:
+          - type: not_null
+        data_tests:
+          - unique
+      - name: snapshot_date
+        description: "Date the features were measured. Same for every row in a single dbt run (parameterizable via dbt var)."
+        data_type: date
+        constraints:
+          - type: not_null
+      - name: tenure_months
+        description: "Months between hire_date and snapshot_date. Integer."
+        data_type: int64
+      - name: performance_tier
+        description: "Performance tier as of snapshot_date (1-5 mapped to string from stg_employees_current.perf_tier)."
+        data_type: string
+      - name: compa_ratio
+        description: "Salary / band midpoint. Centered at 1.00; below = underpaid vs band, above = overpaid."
+        data_type: float64
+      - name: is_critical_role
+        description: "Whether the employee's job is flagged as a critical role (from dim_job)."
+        data_type: bool
+      - name: successor_count
+        description: "Number of ready successors for this role (from raw.succession_plan.successor_readiness_count). Higher = more replaceable. Defaults to 0 if no succession plan row exists."
+        data_type: int64
+      - name: voluntary_exit_label
+        description: "Binary training target. TRUE if employee voluntarily exited within 12 months after snapshot_date, FALSE otherwise (still active OR exited involuntarily OR exited after the 12-month window)."
+        data_type: bool

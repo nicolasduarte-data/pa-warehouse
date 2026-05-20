@@ -1,0 +1,259 @@
+version: 2
+
+# _staging.yml — schema tests for all 6 stg_* models.
+#
+# Test strategy per layer:
+#   - not_null + unique on every PK (guarantees one-row-per-grain)
+#   - not_null on FK columns (orphan detection is a source-layer relationships test,
+#     but we guard here too since staging is the entry point for all downstream)
+#   - accepted_values on every categorical/enum column (catches generator drift early)
+#
+# These tests run as part of `dbt build` — any failure blocks downstream models
+# from materializing in the same run. This is intentional: bad staging data
+# should never silently flow into core or marts.
+
+models:
+
+  # ── stg_employees_current ──────────────────────────────────────────────────
+  - name: stg_employees_current
+    description: >
+      Current state of every employee at window-close. One row per employee.
+      Derived from raw.employees — a point-in-time snapshot, not a history table.
+    columns:
+      - name: employee_id
+        description: "PK. Format: EMP_NNNNN."
+        tests:
+          - not_null
+          - unique
+
+      - name: hire_date
+        description: "Employee hire date. Never null."
+        tests:
+          - not_null
+
+      - name: gender
+        description: "M / F / NB. Conditional on job_level (produces the 13% unadjusted pay gap)."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [M, F, NB]
+
+      - name: job_id
+        description: "FK to raw.jobs.job_id. Never null — every employee has a job."
+        tests:
+          - not_null
+
+      - name: dept_id
+        description: "FK to raw.departments.dept_id. Nullable in rare pre-onboarding cases."
+
+      - name: location_id
+        description: "FK to raw.locations.location_id."
+
+      - name: performance_tier
+        description: "Renamed from perf_tier. Ordinal 1–5; 5 = highest performance."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2, 3, 4, 5]
+              quote: false   # values are INT64 — don't wrap in quotes or BigQuery raises type mismatch
+
+      - name: compa_ratio
+        description: "salary / band_midpoint at window-close. Never null."
+        tests:
+          - not_null
+
+      - name: exit_type
+        description: "term_voluntary / term_involuntary / null (active employees)."
+        tests:
+          - accepted_values:
+              values: [term_voluntary, term_involuntary]
+              # null is valid (active employees) — accepted_values ignores nulls by default
+
+  # ── stg_workforce_events ──────────────────────────────────────────────────
+  - name: stg_workforce_events
+    description: >
+      Typed workforce event stream. One row per event. The source of truth for
+      employee lifecycle timelines. is_regrettable is meaningful only on
+      term_voluntary rows — always False on non-voluntary events.
+    columns:
+      - name: event_id
+        description: "PK. Format: EVT_NNNNNNN."
+        tests:
+          - not_null
+          - unique
+
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id. Never null."
+        tests:
+          - not_null
+
+      - name: event_date
+        description: "Date the event occurred."
+        tests:
+          - not_null
+
+      - name: event_type
+        description: "Type of workforce event."
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - hire
+                - terminate
+                - promote
+                - dept_change
+                - mgr_change
+                - comp_change
+                - term_voluntary
+                - term_involuntary
+
+      - name: is_regrettable
+        description: "CPT-sampled truth label. Only meaningful for term_voluntary rows."
+        tests:
+          - not_null
+
+  # ── stg_compensation ──────────────────────────────────────────────────────
+  - name: stg_compensation
+    description: >
+      Compensation history per employee. Multiple rows per employee — one per
+      comp event. The most recent row (MAX effective_date) is the current comp.
+    columns:
+      - name: comp_id
+        description: "PK. Format: COMP_NNNNNNN."
+        tests:
+          - not_null
+          - unique
+
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+
+      - name: effective_date
+        description: "Date this compensation became effective."
+        tests:
+          - not_null
+
+      - name: salary
+        description: "Annual salary in USD."
+        tests:
+          - not_null
+
+      - name: compa_ratio
+        description: "salary / band_midpoint at this effective date."
+        tests:
+          - not_null
+
+      - name: currency
+        description: "Always USD in this dataset."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [USD]
+
+  # ── stg_performance_ratings ───────────────────────────────────────────────
+  - name: stg_performance_ratings
+    description: >
+      Performance review history per employee. One row per review cycle.
+      Aliased 'rating' → 'performance_rating' for downstream readability.
+    columns:
+      - name: rating_id
+        description: "PK. Format: RTG_NNNNNNN."
+        tests:
+          - not_null
+          - unique
+
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+
+      - name: review_date
+        description: "Date the review was completed."
+        tests:
+          - not_null
+
+      - name: review_cycle
+        description: "MID (mid-year) or YEAR_END (annual). Generator uses YEAR_END, not ANNUAL."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [MID, YEAR_END]
+
+      - name: performance_rating
+        description: "Ordinal 1–5. 5 = highest performance."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2, 3, 4, 5]
+              quote: false   # INT64 column — quote: false prevents type mismatch in BigQuery
+
+      - name: potential_flag
+        description: "LOW / MID / HIGH potential assessment."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [LOW, MID, HIGH]
+
+  # ── stg_survey_responses ──────────────────────────────────────────────────
+  - name: stg_survey_responses
+    description: >
+      Quarterly eNPS survey responses per employee. One row per response.
+      response_category pre-computed at generation; boolean convenience columns
+      added here to simplify downstream SUM() aggregations.
+    columns:
+      - name: survey_id
+        description: "PK. Format: SRV_NNNNNNN."
+        tests:
+          - not_null
+          - unique
+
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+
+      - name: survey_date
+        description: "Date the survey was completed."
+        tests:
+          - not_null
+
+      - name: enps_score
+        description: "Raw NPS score 0–10."
+        tests:
+          - not_null
+
+      - name: response_category
+        description: "PROMOTER / PASSIVE / DETRACTOR."
+        tests:
+          - not_null
+          - accepted_values:
+              values: [PROMOTER, PASSIVE, DETRACTOR]
+
+  # ── stg_succession_plan ───────────────────────────────────────────────────
+  - name: stg_succession_plan
+    description: >
+      Successor readiness per employee at window-close. One row per employee.
+      is_succession_risk convenience column flags critical roles with zero
+      ready successors — the highest IsRegrettableFlag probability in the CPT.
+    columns:
+      - name: succession_id
+        description: "PK. Format: SUC_NNNNNNN."
+        tests:
+          - not_null
+          - unique
+
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+
+      - name: successor_readiness_count
+        description: "Number of ready successors. 0 = single point of failure."
+        tests:
+          - not_null
+
+      - name: is_critical_role
+        description: "True if this employee occupies a critical role."
+        tests:
+          - not_null

@@ -1,0 +1,202 @@
+version: 2
+
+models:
+
+  # ── dim_date ───────────────────────────────────────────────────────────────
+  - name: dim_date
+    description: >
+      Calendar dimension covering 2022-01-01 through 2027-12-31. One row per
+      calendar day. Every fact table joins its date column to dim_date.date_day
+      to get month/quarter/year/weekend flags without repeating DATE functions
+      in every query.
+    columns:
+      - name: date_day
+        description: "PK. One row per calendar day."
+        tests:
+          - not_null
+          - unique
+      - name: month_start
+        description: "First day of the month containing date_day."
+        tests:
+          - not_null
+      - name: year
+        description: "Calendar year as integer."
+        tests:
+          - not_null
+
+  # ── dim_department ─────────────────────────────────────────────────────────
+  - name: dim_department
+    description: >
+      One row per department plus one phantom sentinel row ('__NO_DEPT__').
+      Type 1 — no history. The sentinel row allows the SCD2 dim_employee
+      snapshot to COALESCE NULL dept_ids to '__NO_DEPT__' without breaking
+      relationships tests.
+    columns:
+      - name: dept_id
+        description: "PK. Includes '__NO_DEPT__' sentinel."
+        tests:
+          - not_null
+          - unique
+      - name: dept_name
+        description: "Human-readable department name."
+        tests:
+          - not_null
+
+  # ── dim_job ────────────────────────────────────────────────────────────────
+  - name: dim_job
+    description: >
+      One row per job code. Type 1 — no history. Carries criticality,
+      scarcity, band_midpoint, and job_level metadata used across
+      attrition analysis and pay equity pages.
+    columns:
+      - name: job_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: job_level
+        description: "Level code: IC1, IC2, M1, M2, Director, VP+."
+        tests:
+          - not_null
+      - name: is_critical_role
+        description: "True if this role is flagged critical for succession."
+        tests:
+          - not_null
+      - name: band_midpoint
+        description: "Salary midpoint for this job's pay band (USD)."
+        tests:
+          - not_null
+
+  # ── dim_location ───────────────────────────────────────────────────────────
+  - name: dim_location
+    description: >
+      One row per office location plus one phantom sentinel row ('__NO_LOC__').
+      Type 1 — no history. Sentinel mirrors the COALESCE in the SCD2 snapshot
+      for employees in a remote-pending state at hire.
+    columns:
+      - name: location_id
+        description: "PK. Includes '__NO_LOC__' sentinel."
+        tests:
+          - not_null
+          - unique
+      - name: location_name
+        description: "City name or 'Sentinel — source NULL'."
+        tests:
+          - not_null
+      - name: location_type
+        description: "OFFICE / REMOTE / UNKNOWN (sentinel)."
+        tests:
+          - not_null
+
+  # ── fact_workforce_events ──────────────────────────────────────────────────
+  - name: fact_workforce_events
+    description: >
+      One row per workforce event. 2,569 rows: 1,512 hires + 770 voluntary
+      terminations + 287 involuntary terminations. Org context (dept, job,
+      location) from current employee state — appropriate since no mid-employment
+      attribute changes exist in this synthetic dataset.
+    columns:
+      - name: event_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: event_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: event_type
+        description: "hire / term_voluntary / term_involuntary."
+        tests:
+          - not_null
+      - name: is_regrettable
+        description: "CPT-sampled truth label. Meaningful only on term_voluntary rows."
+        tests:
+          - not_null
+
+  # ── fact_compensation_snapshot ────────────────────────────────────────────
+  - name: fact_compensation_snapshot
+    description: >
+      One row per compensation event per employee. 5,609 rows for 2,500 employees
+      (~2.2 comp events each). Includes job_level and band_midpoint from dim_job
+      for pay equity OLS analysis on Page 4.
+    columns:
+      - name: comp_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: effective_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: salary
+        description: "Annual salary in USD."
+        tests:
+          - not_null
+      - name: compa_ratio
+        description: "salary / band_midpoint. Centered at 1.00."
+        tests:
+          - not_null
+
+  # ── fact_performance_ratings ──────────────────────────────────────────────
+  - name: fact_performance_ratings
+    description: >
+      One row per performance review per employee. 7,454 rows: MID (4,344) +
+      YEAR_END (3,110) cycles. Feeds IsRegrettableFlag last-rating-before-term
+      logic and pay equity OLS Spec 3 control variable.
+    columns:
+      - name: rating_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: review_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: performance_rating
+        description: "Ordinal 1–5. 5 = highest."
+        tests:
+          - not_null
+
+  # ── fact_survey_responses ─────────────────────────────────────────────────
+  - name: fact_survey_responses
+    description: >
+      One row per eNPS survey response. 16,095 rows, quarterly cadence.
+      Boolean columns is_promoter / is_detractor / is_passive enable SUM()-based
+      eNPS calculation without nested CASE expressions in downstream models.
+    columns:
+      - name: survey_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: survey_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: enps_score
+        description: "Raw NPS score 0–10."
+        tests:
+          - not_null
+      - name: response_category
+        description: "PROMOTER / PASSIVE / DETRACTOR."
+        tests:
+          - not_null

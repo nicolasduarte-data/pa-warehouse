@@ -1,6 +1,6 @@
 # pa-warehouse — Python dependencies
-# Per BACKLOG Story 1.1.2 + Research B findings (2026-05-15)
-# dbt 1.9+ required for `dbt_valid_to_current` config used in Loop 2 (Story 2.8)
+# dbt 1.9+ required for `dbt_valid_to_current` config used in the SCD2
+# dim_employee snapshot.
 
 # Core data libraries
 pandas>=2.0,<3.0
@@ -8,7 +8,7 @@ numpy>=1.24,<2.0
 scipy>=1.11,<2.0              # scipy.stats.lognorm for tenure; Hellinger via scipy.spatial.distance
 faker>=22.0,<25.0             # string attributes only (names, emails) — not a synthetic data generator
 scikit-learn>=1.4,<2.0        # TSTS baseline (logistic regression) + Spearman correlation
-statsmodels>=0.14,<1.0        # Progressive OLS for pay equity panel (Story 3.6.3) — native p-values, log-linear
+statsmodels>=0.14,<1.0        # Progressive OLS for pay equity panel — native p-values, log-linear
 
 # BigQuery client
 google-cloud-bigquery>=3.20
@@ -16,8 +16,8 @@ google-cloud-bigquery>=3.20
 # dbt — must be 1.9+ for dbt_valid_to_current snapshot config
 dbt-core>=1.9,<2.0
 dbt-bigquery>=1.9,<2.0
-dbt-snowflake>=1.9,<2.0       # Loop 5 validation port
+dbt-snowflake>=1.9,<2.0       # for the Snowflake validation port
 
-# Removed per Research B (2026-05-15):
-#   lifelines  — replaced by scipy.stats.lognorm (Weibull rejected; log-normal preferred for non-monotone HR hazard)
-#   sdmetrics  — replaced by Hellinger + Kaplan-Meier + Spearman + FK assertions (Story 2.5)
+# Deliberately NOT used:
+#   lifelines  — scipy.stats.lognorm is sufficient (Weibull rejected; log-normal preferred for non-monotone HR hazard)
+#   sdmetrics  — replaced by Hellinger + Kaplan-Meier + Spearman + FK assertions in validate.py
