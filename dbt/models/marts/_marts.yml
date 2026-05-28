@@ -7,6 +7,13 @@ version: 2
 # dbt model contracts: catch type/column changes at warehouse compile time,
 # before downstream consumers (ML pipelines, BI tools, other teams) discover
 # the break.
+#
+# COLUMN MUTABILITY METADATA (paw-prey-005 Story 5.3):
+# Every column carries a `meta.mutability` key with one of four values:
+# immutable / slowly_mutable / mutable / label. The canonical definition of
+# the convention — what each value means, why it exists, and how downstream
+# ML consumers use it — lives in models/core/_core.yml at the top. See there
+# before adding new columns to this file.
 
 models:
 
@@ -25,6 +32,8 @@ models:
       - name: employee_id
         description: "Stable employee key. PK of the snapshot row (one row per employee at snapshot_date)."
         data_type: string
+        meta:
+          mutability: immutable
         constraints:
           - type: not_null
         data_tests:
@@ -32,23 +41,112 @@ models:
       - name: snapshot_date
         description: "Date the features were measured. Same for every row in a single dbt run (parameterizable via dbt var)."
         data_type: date
+        meta:
+          mutability: immutable   # anchor; fixed per-row at materialization
         constraints:
           - type: not_null
       - name: tenure_months
         description: "Months between hire_date and snapshot_date. Integer."
         data_type: int64
+        meta:
+          mutability: slowly_mutable   # advances monotonically while active
       - name: performance_tier
         description: "Performance tier as of snapshot_date (1-5 mapped to string from stg_employees_current.perf_tier)."
         data_type: string
+        meta:
+          mutability: mutable   # changes per review cycle; valid DiCE perturbation target
       - name: compa_ratio
         description: "Salary / band midpoint. Centered at 1.00; below = underpaid vs band, above = overpaid."
         data_type: float64
+        meta:
+          mutability: mutable   # changes per comp event; valid DiCE perturbation target
       - name: is_critical_role
         description: "Whether the employee's job is flagged as a critical role (from dim_job)."
         data_type: bool
+        meta:
+          mutability: slowly_mutable   # follows job_id; changes on promotion / role change
       - name: successor_count
         description: "Number of ready successors for this role (from raw.succession_plan.successor_readiness_count). Higher = more replaceable. Defaults to 0 if no succession plan row exists."
         data_type: int64
+        meta:
+          mutability: mutable   # updated as succession plans evolve
+      - name: age_at_window_close
+        description: >
+          Employee's age in completed years at snapshot_date (paw-prey-005
+          Story 5.2.2). Computed via ROUND(date_diff(snapshot_date, birth_date,
+          day) / 365.25) — see model SQL comments for the dialect/precision
+          rationale. Range [18, 100] enforced via accepted_range test below;
+          rp Epic 5 uses this as the compound fairness attribute alongside
+          gender.
+        data_type: int64
+        meta:
+          mutability: immutable   # birth_date-derived; protected attribute (Epic 5)
+        constraints:
+          - type: not_null
+        data_tests:
+          - dbt_utils.accepted_range:
+              min_value: 18
+              max_value: 100
+              inclusive: true
+      - name: gender
+        description: >
+          M / F / NB (paw-prey-005 Story 5.2.2). Sourced from raw.employees
+          via stg_employees_current. Type 1 attribute in the SCD2 snapshot
+          (never changes for an employee). rp Epic 5 uses this as a protected
+          attribute for fairness/disparate-impact metrics.
+        data_type: string
+        meta:
+          mutability: immutable   # protected attribute (Epic 5); DiCE may NOT perturb
+        constraints:
+          - type: not_null
+        data_tests:
+          - accepted_values:
+              values: [M, F, NB]
+      - name: enps
+        description: >
+          Per-employee eNPS score computed as ROUND((promoters - detractors) /
+          total_responses × 100), cast INT64. Aggregated over all survey
+          responses with survey_date ≤ snapshot_date. NULL when no surveys
+          exist before snapshot_date (intentional — valid missingness signal).
+          Range: -100 to 100. (paw-prey-006)
+        data_type: int64
+        meta:
+          mutability: mutable   # changes as survey responses accumulate
+      - name: engagement_score
+        description: >
+          Per-employee average engagement rating (1.0–5.0 Likert scale),
+          aggregated over all survey responses with survey_date ≤ snapshot_date.
+          NULL when no surveys exist before snapshot_date. Positively correlated
+          with perf_tier in the generator (lower engagement → higher attrition
+          risk). Loop 2 hybrid cohort uses this as incremental signal beyond
+          HRIS features. (paw-prey-006)
+        data_type: float64
+        meta:
+          mutability: mutable   # changes as survey responses accumulate
+        data_tests:
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+              where: "engagement_score is not null"
+      - name: manager_relationship_score
+        description: >
+          Per-employee average manager relationship rating (1.0–5.0 Likert
+          scale), aggregated over all survey responses with survey_date ≤
+          snapshot_date. NULL when no surveys exist before snapshot_date.
+          Weakly correlated with perf_tier (manager quality is more org-random).
+          Noisier signal than engagement_score. (paw-prey-006)
+        data_type: float64
+        meta:
+          mutability: mutable   # changes as survey responses accumulate
+        data_tests:
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+              where: "manager_relationship_score is not null"
       - name: voluntary_exit_label
         description: "Binary training target. TRUE if employee voluntarily exited within 12 months after snapshot_date, FALSE otherwise (still active OR exited involuntarily OR exited after the 12-month window)."
         data_type: bool
+        meta:
+          mutability: label   # training target — not a feature; DiCE excludes

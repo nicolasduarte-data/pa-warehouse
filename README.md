@@ -29,10 +29,109 @@ Full plan: [`BACKLOG.md`](./BACKLOG.md).
 
 ## Stack
 
-- **Warehouse:** BigQuery (billing-enabled free tier; permanent live artifact)
-- **Transformation:** dbt-core (`dbt-bigquery` primary, `dbt-snowflake` secondary)
+- **Warehouse:** BigQuery (primary; billing-enabled free tier; permanent live artifact) + **Snowflake** (validation port, parity-tested)
+- **Transformation:** dbt-core 1.11 (`dbt-bigquery` primary, `dbt-snowflake` parity target)
 - **BI:** Looker Studio (live BigQuery connector, public read-only)
-- **Generator:** Python 3.11 — `scipy.stats.lognorm` + `faker` + Gaussian copula + CPT (per research synthesis 2026-05-15)
+- **Generator:** Python 3.11 — `scipy.stats.lognorm` + `scipy.stats.truncnorm` + `faker` + Gaussian copula + CPT (per research synthesis 2026-05-15)
+
+---
+
+## Multi-Vendor Stack
+
+> **The Snowflake claim isn't aspirational.** The same dbt project builds against BigQuery (primary) AND Snowflake (validation port). Aggregate outputs on `marts.v_attrition_features` are parity-tested at 26 columns: row counts and label distribution exact-match, continuous statistics within 0.1% tolerance.
+
+### Why multi-vendor?
+
+Real People Analytics teams operate across multiple warehouses — BigQuery, Snowflake, Redshift, Databricks. dbt's profile architecture lets the same model SQL build against any of them with a single CLI flag (`--target`). This project is built primary on BigQuery (for the native Looker Studio connector) and validated on Snowflake to demonstrate that the entire transformation layer is genuinely portable — not just "uses standard SQL where convenient."
+
+The Deel rejection post-mortem (March 2026) confirmed Snowflake as an explicit ATS filter for People Analytics roles at companies in the Visier / Lattice / Lendbuzz tier. "Adapter pinned in `pyproject.toml`" passes the ATS scan but reads as future-intent under careful reviewer reading. This section is the evidence that the port actually executes.
+
+### Dialect adjustments
+
+| Class | BigQuery | Snowflake | Resolution |
+|---|---|---|---|
+| Date arithmetic | `date_trunc(d, month)` | `date_trunc('month', d)` | `{{ dbt.date_trunc('month', 'd') }}` — dbt-core built-in (formerly `dbt_utils`, [migrated in v1.0](https://docs.getdbt.com/blog/announcing-cross-database-macros)) |
+| Date diff | `date_diff(end, start, month)` | `datediff(month, start, end)` | `{{ dbt.datediff('start', 'end', 'month') }}` |
+| Date add/sub | `date_add(d, interval 12 month)` | `dateadd(month, 12, d)` | `{{ dbt.dateadd('month', 12, 'd') }}` |
+| Conditional count | `countif(condition)` | `count_if(condition)` | Custom macro [`dbt/macros/count_if.sql`](./dbt/macros/count_if.sql) |
+| Integer cast | `cast(x as int64)` | `cast(x as integer)` | `{{ dbt.type_int() }}` |
+| Float cast | `cast(x as float64)` | `cast(x as float)` | `{{ dbt.type_float() }}` |
+| Boolean cast | `cast(x as bool)` | `cast(x as boolean)` | `{{ dbt.type_boolean() }}` |
+| String formatting | `format_date('%b %Y', d)` | `to_char(d, 'Mon YYYY')` | Jinja conditional in [`dim_date.sql`](./dbt/models/core/dim_date.sql) |
+| Day-of-week numbering | Sun=1, Sat=7 | Sun=0, Sat=6 (default) | Jinja conditional in [`dim_date.sql`](./dbt/models/core/dim_date.sql) |
+| Source DB resolution | `target.project` | `target.database` | Jinja conditional in [`sources.yml`](./dbt/models/sources.yml) |
+| Contract enforcement | Type names match | Type names don't map | `{'enforced': target.type == 'bigquery'}` |
+
+Originally scoped (per Research A 2026-05) as three rewrite points — `DATE_TRUNC` argument order, `GENERATE_DATE_ARRAY` → `dbt_utils.date_spine`, and `STRUCT/ARRAY` verification. Execution surfaced the additional divergences above. None required schema restructuring — all resolvable at the macro / Jinja layer with the same physical schema on both targets.
+
+### Parity validation
+
+[`scripts/parity_check.py`](./scripts/parity_check.py) executes a 26-column aggregate query against `marts.v_attrition_features` on both targets and asserts column-by-column equivalence (exact match for counts and dates; 0.1% relative tolerance for continuous statistics). Run:
+
+```bash
+source ~/.dbt/snowflake.env
+export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.gcp/pa-warehouse-sa.json"
+python scripts/parity_check.py
+```
+
+**Result (2026-05-22):**
+
+```
+Total: 26 passed, 0 mismatched out of 26 columns
+
+>>> PARITY VALIDATED. <<<
+```
+
+Selected rows from the comparison table:
+
+| Column | BigQuery | Snowflake | Verdict |
+|---|---|---|---|
+| `row_count` | 1278 | 1278 | PASS |
+| `employee_count` | 1278 | 1278 | PASS |
+| `label_positive_count` | 240 | 240 | PASS |
+| `label_positive_rate` | 0.187793 | 0.187793 | PASS |
+| `avg_tenure_months` | 19.0681 | 19.068075 | PASS |
+| `avg_compa_ratio` | 1.00774 | 1.00774 | PASS |
+| `avg_age` | 38.4773 | 38.477308 | PASS |
+| `std_compa_ratio` | 0.0810031 | 0.0810031 | PASS |
+| `count_gender_f` | 578 | 578 | PASS |
+| `count_critical_role` | 319 | 319 | PASS |
+
+Side-by-side screenshots from the BigQuery + Snowsight consoles:
+
+| BigQuery | Snowflake |
+|---|---|
+| ![BigQuery parity result](./screenshots/parity-bigquery.png) | ![Snowflake parity result](./screenshots/parity-snowflake.png) |
+
+### Reproducing
+
+Both targets share `~/.dbt/profiles.yml` (under the `pa_warehouse` profile, with `dev` = BigQuery and `snowflake` = Snowflake outputs). After loading raw data to the chosen target:
+
+```bash
+# BigQuery — default target
+python generator/load_raw.py
+cd dbt
+dbt build              # implicit --target dev
+
+# Snowflake — validation port
+source ~/.dbt/snowflake.env
+python generator/load_raw_snowflake.py
+cd dbt
+dbt build --target snowflake
+```
+
+### Snowflake post-expiry reproducibility note
+
+This parity validation was run on a Snowflake free-tier trial (signed up 2026-05-21, expires ~2026-06-13). After expiry the credentials stop working but the parity screenshots and `scripts/parity_check.py` output persist as historical artifacts proving the port was executed.
+
+**To reproduce the parity check today:**
+1. Sign up for a new Snowflake free-tier trial (30 days, $400 credit, no credit card at https://signup.snowflake.com)
+2. Run `scripts/snowflake_bootstrap.sql` in a Snowsight worksheet (replace the public-key placeholder per `scripts/snowflake_keygen.md`)
+3. Update `account:` in `~/.dbt/profiles.yml`
+4. `python generator/load_raw_snowflake.py && cd dbt && dbt build --target snowflake`
+5. `python scripts/parity_check.py`
+
+The dbt project, dialect adjustments, parity script, and bootstrap SQL are all committed — only the live Snowflake account is ephemeral.
 
 ---
 
@@ -148,6 +247,8 @@ dbt build --select package:dbt_project_evaluator
 | `compa_ratio` | FLOAT64 | Salary / band midpoint. Centered at 1.00. Below = underpaid vs band. |
 | `is_critical_role` | BOOL | Whether the employee's job is flagged as critical (from `dim_job`). |
 | `successor_count` | INT64 | Number of ready successors for this role. Higher = more replaceable. Defaults to 0 if no succession plan row exists. |
+| `age_at_window_close` | INT64 | Employee's age in completed years at `snapshot_date`. Computed as `ROUND(date_diff(snapshot_date, birth_date, day) / 365.25)`. Range [18, 100] enforced. Immutable / protected attribute. |
+| `gender` | STRING | M / F / NB. Type 1 attribute (never changes). Immutable / protected attribute. |
 | `voluntary_exit_label` | BOOL | **Training target.** TRUE if the employee voluntarily exited within 12 months after `snapshot_date`. FALSE if still active OR exited involuntarily OR exited after the 12-month window. |
 
 **Parameterization:** `snapshot_date` defaults to 12 months before `current_date()`, guaranteeing the label window has fully elapsed. Override via dbt var to train on multiple historical snapshots and avoid label leakage:
@@ -170,6 +271,57 @@ WHERE snapshot_date = '2025-05-20'
 ```
 
 **Label leakage prevention:** Features are computed AS OF `snapshot_date`. The label looks ONLY at exits in `(snapshot_date, snapshot_date + 12 months]`. Pre-snapshot exits are not in the active cohort; post-window exits are censored to FALSE.
+
+---
+
+## Column Mutability Metadata for ML Consumers
+
+Every column in `core.dim_employee_snapshot` and `marts.v_attrition_features` carries a `meta.mutability` key in its dbt schema YAML. The convention is canonical in [`dbt/models/core/_core.yml`](./dbt/models/core/_core.yml) (header block); this section is the reader-facing summary.
+
+### The four values
+
+| Value | Meaning | Examples |
+|---|---|---|
+| `immutable` | Fixed once set; cannot change for a given `employee_id`. | `employee_id`, `hire_date`, `birth_date`, `age_at_hire`, `age_at_window_close`, `gender` |
+| `slowly_mutable` | Changes infrequently (weeks to months); tracked by the SCD2 snapshot. | `job_id`, `dept_id`, `location_id`, `tenure_months`, `is_critical_role` |
+| `mutable` | Changes frequently (daily to monthly); modelled as point-in-time facts. | `compa_ratio`, `performance_tier`, `manager_id`, `successor_count` |
+| `label` | Training target — not a feature. Excluded from feature-engineering and counterfactual perturbation. | `voluntary_exit_label` |
+
+### Why this matters for downstream ML
+
+The metadata is consumed by the retention-prediction project (`projects/hrds/retention-prediction/`) to drive three concrete decisions:
+
+1. **Feature catalog generation** (rp Epic 1) — `immutable` and `slowly_mutable` columns are stable predictors. `mutable` columns require careful snapshot alignment to avoid leakage. The catalog auto-tags each feature so downstream code can default to safe handling.
+
+2. **Counterfactual feasibility** (rp Epic 6 — DiCE) — DiCE generates "what would have to change for this person to be retained" explanations. It may only perturb `mutable` columns. Recommending an employee change their `birth_date` is absurd; recommending a manager reassignment is actionable. Mutability metadata makes that filter declarative instead of hard-coded.
+
+3. **Fairness pre-processing** (rp Epic 5) — `immutable` demographic attributes (age, gender) are protected attributes and enter the model under bias-mitigation discipline. The convention names them clearly so they cannot be accidentally treated as ordinary features.
+
+### How to read it
+
+In `dbt/models/core/_core.yml` and `dbt/models/marts/_marts.yml`:
+
+```yaml
+- name: compa_ratio
+  description: "Salary / band midpoint..."
+  data_type: float64
+  meta:
+    mutability: mutable   # changes per comp event
+```
+
+In Python (rp side, after `dbt parse` produces a manifest):
+
+```python
+from dbt.cli.main import dbtRunner
+manifest = dbtRunner().invoke(["parse"]).result
+node = manifest.nodes["model.pa_warehouse.v_attrition_features"]
+for col in node.columns.values():
+    print(col.name, col.meta.get("mutability"))
+```
+
+### Cross-reference
+
+The canonical consumer-side spec lives at `projects/hrds/retention-prediction/docs/integration_contract.md` (created in rp Epic 0 Story 0.5.3 — `rp-prey-001`). Until that prey ships, the spec above is the source of truth.
 
 ---
 

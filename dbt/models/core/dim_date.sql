@@ -49,8 +49,12 @@ dates as (
 -- so no circular dependency.
 observation_bounds as (
     select
-        date_trunc(min(case when event_type = 'hire' then event_date end), month) as window_start,
-        last_day(max(event_date), month) as window_end
+        -- date_trunc dialect: BQ is date_trunc(date, part); Snowflake is
+        -- date_trunc('part', date). dbt.date_trunc handles both.
+        {{ dbt.date_trunc('month', "min(case when event_type = 'hire' then event_date end)") }} as window_start,
+        -- last_day(date, part) — supported by BOTH adapters' last_day implementations,
+        -- but routing through dbt.last_day keeps the dependency explicit.
+        {{ dbt.last_day('max(event_date)', 'month') }} as window_end
     from {{ ref('fact_workforce_events') }}
 )
 
@@ -67,30 +71,57 @@ select
     -- date_trunc snaps a date back to the first day of its period.
     -- Fact tables join on month_start to aggregate by month without
     -- needing to call date_trunc in every downstream query.
-    date_trunc(d.date_day, month)   as month_start,
-    date_trunc(d.date_day, quarter) as quarter_start,
-    date_trunc(d.date_day, year)    as year_start,
+    -- Cast to DATE: dbt.date_trunc compiles to timestamp_trunc on BigQuery,
+    -- which returns TIMESTAMP. Downstream models (v_workforce_overview) compare
+    -- month_start against DATE columns — cast enforces the correct type.
+    cast({{ dbt.date_trunc('month',   'd.date_day') }} as date) as month_start,
+    cast({{ dbt.date_trunc('quarter', 'd.date_day') }} as date) as quarter_start,
+    cast({{ dbt.date_trunc('year',    'd.date_day') }} as date) as year_start,
 
     -- Human-readable labels for dashboard filter dropdowns and chart axes.
-    format_date('%b %Y', d.date_day)  as month_label,    -- "Jan 2024"
-    format_date('%Y-Q%Q', d.date_day) as quarter_label,  -- "2024-Q1"
+    -- Cross-dialect (paw-prey-005 Story 5.6):
+    --   BigQuery's format_date('%b %Y', d) uses strftime — Snowflake doesn't
+    --   support strftime. Snowflake uses to_char(d, 'Mon YYYY') with Oracle-
+    --   style format specifiers. Outputs differ slightly in case ('Jan' vs
+    --   'JAN' depending on format) — acceptable: the parity check measures
+    --   row counts and aggregates, not string label equality.
+    {%- if target.type == 'bigquery' %}
+    format_date('%b %Y',  d.date_day)                        as month_label,
+    format_date('%Y-Q%Q', d.date_day)                        as quarter_label,
+    {%- else %}
+    to_char(d.date_day, 'Mon YYYY')                          as month_label,
+    to_char(d.date_day, 'YYYY') || '-Q' || extract(quarter from d.date_day) as quarter_label,
+    {%- endif %}
 
     -- ── Day of week ──────────────────────────────────────────────────────────
-    -- BigQuery DAYOFWEEK: 1 = Sunday, 7 = Saturday.
-    extract(dayofweek from d.date_day) as day_of_week,
-    format_date('%A', d.date_day)      as day_name,       -- "Monday"
+    -- Cross-dialect: dayofweek numbering differs (BQ 1-7 Sun=1, Snowflake 0-6
+    -- Sun=0 by default), so the integer column itself is target-dependent —
+    -- consumers must read day_name (the string) for portable logic.
+    extract(dayofweek from d.date_day)                       as day_of_week,
 
-    -- Weekend flag — used to exclude non-business days from some HR metrics.
-    extract(dayofweek from d.date_day) in (1, 7) as is_weekend,
+    {%- if target.type == 'bigquery' %}
+    format_date('%A', d.date_day)                            as day_name,
+    -- BQ DAYOFWEEK: 1 = Sunday, 7 = Saturday.
+    extract(dayofweek from d.date_day) in (1, 7)             as is_weekend,
+    {%- else %}
+    -- Snowflake's "Day" format pads to 9 chars with spaces; trim cleans it up.
+    -- Returns "Monday", "Tuesday", etc. — same shape as BQ's '%A'.
+    trim(to_char(d.date_day, 'Day'))                         as day_name,
+    -- Snowflake DAYOFWEEK: 0 = Sunday, 6 = Saturday (default policy).
+    extract(dayofweek from d.date_day) in (0, 6)             as is_weekend,
+    {%- endif %}
 
     -- ── Observation window flag ───────────────────────────────────────────────
     -- TRUE for days within the dynamically-detected window. Dashboards filter
     -- on this so charts don't show empty leading/trailing periods.
-    d.date_day between ob.window_start and ob.window_end as is_in_observation_window,
+    -- dbt.date_trunc returns TIMESTAMP on BigQuery (not DATE), so cast both
+    -- bounds to DATE before the BETWEEN — BigQuery rejects DATE BETWEEN TIMESTAMP.
+    d.date_day between cast(ob.window_start as date) and cast(ob.window_end as date)
+        as is_in_observation_window,
 
     -- Expose the bounds themselves for any downstream model that needs them.
-    ob.window_start as observation_window_start,
-    ob.window_end   as observation_window_end
+    cast(ob.window_start as date) as observation_window_start,
+    cast(ob.window_end   as date) as observation_window_end
 
 from dates d
 cross join observation_bounds ob

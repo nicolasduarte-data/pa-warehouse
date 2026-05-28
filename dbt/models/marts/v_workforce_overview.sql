@@ -89,18 +89,21 @@ headcount_snapshot as (
 -- artifact at the dashboard's leading/trailing edges.
 monthly_flows as (
     select
-        date_trunc(fe.event_date, month)   as month_start,
+        -- Cast to DATE: dbt.date_trunc compiles to timestamp_trunc on BigQuery.
+        -- month_spine.month_start is DATE (from dim_date after its own fix), so
+        -- both sides of the join and the returned column must match.
+        cast({{ dbt.date_trunc('month', 'fe.event_date') }} as date) as month_start,
         fe.dept_id,
         j.job_level,
         j.job_family,
-        countif(fe.is_hire)                as hire_count,
-        countif(fe.is_voluntary_term)      as voluntary_term_count,
-        countif(fe.is_involuntary_term)    as involuntary_term_count,
-        countif(fe.is_any_term)            as total_term_count,
-        countif(fe.is_hire) - countif(fe.is_any_term) as net_change
+        {{ count_if('fe.is_hire') }}                as hire_count,
+        {{ count_if('fe.is_voluntary_term') }}      as voluntary_term_count,
+        {{ count_if('fe.is_involuntary_term') }}    as involuntary_term_count,
+        {{ count_if('fe.is_any_term') }}            as total_term_count,
+        {{ count_if('fe.is_hire') }} - {{ count_if('fe.is_any_term') }} as net_change
     from {{ ref('fact_workforce_events') }} fe
     left join jobs j on fe.job_id = j.job_id
-    inner join month_spine m on date_trunc(fe.event_date, month) = m.month_start
+    inner join month_spine m on cast({{ dbt.date_trunc('month', 'fe.event_date') }} as date) = m.month_start
     group by 1, 2, 3, 4
 )
 

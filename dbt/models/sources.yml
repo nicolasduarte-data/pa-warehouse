@@ -8,11 +8,20 @@ version: 2
 
 sources:
   - name: raw
-    database: pa-warehouse-prod   # GCP project ID
-    schema: raw                   # BigQuery dataset name
+    # Cross-target database resolution (paw-prey-005 Story 5.6 — Snowflake port):
+    #   - dbt-bigquery exposes the GCP project as `target.project` (e.g.
+    #     'pa-warehouse-prod'). It does NOT populate `target.database`.
+    #   - dbt-snowflake exposes the Snowflake database as `target.database`
+    #     (e.g. 'PA_WAREHOUSE'). It does NOT populate `target.project`.
+    # The conditional below selects the right attribute per adapter so the
+    # SAME source ref (`source('raw', 'employees')`) resolves correctly on
+    # both targets without changing model SQL.
+    database: "{{ target.project if target.type == 'bigquery' else target.database }}"
+    schema: raw                   # case folds to RAW on Snowflake automatically
     description: >
-      Raw landing zone. Data loaded by generator/load_raw.py directly from
-      generator output CSVs. No transformations applied — this is the truth source.
+      Raw landing zone. Data loaded by `generator/load_raw.py` (BigQuery) or
+      `generator/load_raw_snowflake.py` (Snowflake) directly from generator
+      output CSVs. No transformations applied — this is the truth source.
 
     tables:
       # ── Static dimension lookups ──────────────────────────────────────────
@@ -101,6 +110,27 @@ sources:
               - not_null
               - accepted_values:
                   values: [M, F, NB]
+          - name: birth_date
+            description: >
+              Immutable per-employee date of birth (paw-prey-005 Story 5.1.1).
+              Back-derived from age_at_hire and hire_date in the generator
+              (truncnorm μ=36 σ=10 bounds [18, 70]). Downstream marts compute
+              age_at_window_close from this column at any snapshot_date.
+            tests:
+              - not_null
+          - name: age_at_hire
+            description: >
+              Integer age in years at hire_date (paw-prey-005 Story 5.1.4).
+              Derived from the same truncnorm draw that produced birth_date.
+              Kept in the CSV alongside birth_date for analytic convenience —
+              the two are mutually-derivable but co-storing avoids repeated
+              date arithmetic in ad-hoc queries.
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 18
+                  max_value: 70
+                  inclusive: true
           - name: dept_id
             description: "FK to raw.departments.dept_id."
             tests:

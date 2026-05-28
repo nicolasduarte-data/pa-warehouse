@@ -7,7 +7,7 @@
 {{ config(materialized='view') }}
 
 select
-    date_trunc(event_date, month)  as hire_month,
+    {{ dbt.date_trunc('month', 'event_date') }} as hire_month,
     count(*)                        as hire_count
 from {{ source('raw', 'workforce_events') }}
 where event_type = 'hire'

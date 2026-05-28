@@ -230,6 +230,24 @@ models:
           - accepted_values:
               values: [PROMOTER, PASSIVE, DETRACTOR]
 
+      - name: engagement_score
+        description: "Likert engagement rating 1.0–5.0. Positively correlated with perf_tier. (paw-prey-006)"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+
+      - name: manager_relationship_score
+        description: "Likert manager relationship rating 1.0–5.0. Weakly correlated with perf_tier. (paw-prey-006)"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+
   # ── stg_succession_plan ───────────────────────────────────────────────────
   - name: stg_succession_plan
     description: >

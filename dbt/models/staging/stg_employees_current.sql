@@ -24,6 +24,14 @@ select
     -- this synthetic dataset. It is NOT a check_col in the SCD2 snapshot.
     gender,
 
+    -- birth_date + age_at_hire (paw-prey-005 Story 5.2.1) — both immutable per
+    -- employee. They flow through to dim_employee_snapshot as Type 1 attrs (NOT
+    -- in check_cols — they cannot change, so the SCD2 engine should never see
+    -- a "change" event on them). Downstream marts (v_attrition_features) use
+    -- birth_date to compute age_at_window_close at any snapshot_date.
+    birth_date,
+    age_at_hire,
+
     -- ── Org position ────────────────────────────────────────────────────────
     -- These four FK columns drive the SCD2 snapshot (dim_employee). Changes
     -- in any of them should generate a new SCD2 history row.

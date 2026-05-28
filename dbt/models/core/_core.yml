@@ -1,5 +1,42 @@
 version: 2
 
+# ─── Column Mutability Convention (paw-prey-005 Story 5.3) ────────────────────
+# Every column in dim_employee_snapshot AND v_attrition_features carries a
+# `meta.mutability` key with one of four values:
+#
+#   immutable        — value is fixed once set; cannot change for a given
+#                      employee_id. Examples: birth_date, age_at_hire, gender,
+#                      hire_date, employee_id.
+#   slowly_mutable   — value changes infrequently (weeks to months), tracked
+#                      by the SCD2 snapshot. Examples: job_id, dept_id,
+#                      location_id, tenure-derived measures.
+#   mutable          — value changes frequently (daily to monthly) and is
+#                      modelled as point-in-time facts elsewhere. Examples:
+#                      compa_ratio, performance_tier, manager_id, survey
+#                      response counts, successor_count.
+#   label            — applies only to v_attrition_features.voluntary_exit_label.
+#                      The training target — not a feature. Excluded from
+#                      counterfactual perturbation in rp Epic 6 (DiCE).
+#
+# WHY THIS MATTERS — downstream ML consumers (rp project, Epics 1 / 5 / 6) use
+# this metadata to:
+#   1) auto-generate the feature catalog (rp Epic 1) — immutable + slowly_mutable
+#      features are stable predictors; mutable features need careful snapshot
+#      alignment to avoid leakage.
+#   2) drive DiCE counterfactual feasibility (rp Epic 6) — DiCE may only perturb
+#      mutable columns when generating "what would have to change" explanations.
+#      Recommending an employee change their birth_date is absurd; recommending
+#      a manager reassignment is actionable.
+#   3) enforce fairness pre-processing (rp Epic 5) — immutable demographic
+#      attributes (birth_date-derived age, gender) are protected attributes and
+#      enter the model under bias-mitigation discipline.
+#
+# CROSS-REFERENCE — the canonical consumer-side spec lives at:
+#   projects/hrds/retention-prediction/docs/integration_contract.md
+# (Created in rp Epic 0 Story 0.5.3 — rp-prey-001. Forward reference; the file
+# does not yet exist as of paw-prey-005's close.)
+# ──────────────────────────────────────────────────────────────────────────────
+
 models:
 
   # ── dim_date ───────────────────────────────────────────────────────────────
@@ -198,5 +235,123 @@ models:
           - not_null
       - name: response_category
         description: "PROMOTER / PASSIVE / DETRACTOR."
+        tests:
+          - not_null
+      - name: engagement_score
+        description: "Likert engagement rating 1.0–5.0. (paw-prey-006)"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+      - name: manager_relationship_score
+        description: "Likert manager relationship rating 1.0–5.0. (paw-prey-006)"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+
+# ── dim_employee_snapshot ─────────────────────────────────────────────────────
+# Documented as a snapshot (dbt's first-class type for SCD2). Lives in
+# core.dim_employee_snapshot per the snapshot's target_schema='core' config.
+# Added paw-prey-005 Story 5.2.1 — the snapshot existed before but was
+# undocumented at the YAML layer. Story 5.3 will append meta.mutability blocks
+# per column.
+snapshots:
+  - name: dim_employee_snapshot
+    description: >
+      SCD2 history of employee org position. One row per (employee_id,
+      validity_window) — new rows are inserted when any check_col changes
+      (dept_id_safe, job_id, manager_id_safe, location_id_safe). Immutable
+      attributes (birth_date, age_at_hire, gender, hire_date, employee_id)
+      ride along on every history row. Mutable attributes that should NOT
+      trigger new history (perf_tier, compa_ratio) are excluded from the
+      snapshot — they're modelled via fact_compensation_snapshot and
+      fact_performance_ratings instead.
+    columns:
+      - name: employee_id
+        description: "Stable business key. The SCD2 snapshot's unique_key."
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+
+      # Type 1 (pass-through) — immutable identity / demographics
+      - name: first_name
+        description: "Synthetic first name (Faker). Type 1 — unchanging."
+        meta:
+          mutability: immutable
+      - name: last_name
+        description: "Synthetic last name (Faker). Type 1 — unchanging."
+        meta:
+          mutability: immutable
+      - name: email
+        description: "first.last.N@example.com. Type 1 — unchanging."
+        meta:
+          mutability: immutable
+      - name: hire_date
+        description: "Date the employee was hired. Type 1 — unchanging."
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+      - name: gender
+        description: "M / F / NB. Type 1 — Story 2.1.0 assigns this conditional on job_level."
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+          - accepted_values:
+              values: [M, F, NB]
+      - name: birth_date
+        description: >
+          Immutable per-employee date of birth (paw-prey-005 Story 5.1.1).
+          Back-derived in the generator from age_at_hire and hire_date
+          (truncnorm μ=36 σ=10, bounds [18, 70]). Consistent across all SCD2
+          versions of an employee — confirmed via Story 5.6.5 backfill check.
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+      - name: age_at_hire
+        description: >
+          Integer age in years at hire_date (paw-prey-005 Story 5.1.4).
+          Mutually derivable with birth_date; co-stored for analytic
+          ergonomics. Range [18, 70] enforced at the source.
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 18
+              max_value: 70
+              inclusive: true
+
+      # Type 2 (check_cols) — drive new history rows
+      - name: job_id
+        description: "FK to dim_job. Type 2 — changes on promotion / role change."
+        meta:
+          mutability: slowly_mutable
+        tests:
+          - not_null
+      - name: dept_id_safe
+        description: "FK to dim_department. NULL coalesced to '__NO_DEPT__'. Type 2 — changes on dept transfer."
+        meta:
+          mutability: slowly_mutable
+        tests:
+          - not_null
+      - name: manager_id_safe
+        description: "FK to dim_employee_snapshot.employee_id. NULL coalesced to '__NO_MGR__'. Type 2 — changes on reassignment."
+        meta:
+          mutability: mutable
+        tests:
+          - not_null
+      - name: location_id_safe
+        description: "FK to dim_location. NULL coalesced to '__NO_LOC__'. Type 2 — changes on office/remote transition."
+        meta:
+          mutability: slowly_mutable
         tests:
           - not_null

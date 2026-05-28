@@ -50,7 +50,13 @@ select
     -- ── Org context ───────────────────────────────────────────────────────────
     employees.dept_id,
     employees.location_id,
-    employees.gender
+    employees.gender,
+
+    -- ── Survey signal columns (paw-prey-006) ─────────────────────────────────
+    -- Pass-through from staging — aggregation to employee grain happens in
+    -- v_attrition_features where the snapshot_date leakage gate is applied.
+    surveys.engagement_score,
+    surveys.manager_relationship_score
 
 from surveys
 left join employees using (employee_id)

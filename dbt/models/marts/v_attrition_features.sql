@@ -33,21 +33,37 @@
 -- Schema enforced via `_marts.yml` — column type drift breaks the build at
 -- `dbt run`, not at training time.
 
+{# Contract enforcement: BigQuery is the primary target — schema contracts
+   are enforced there to catch type drift at build time. On Snowflake (validation
+   port) we skip contract enforcement because the YAML data_type values
+   (int64, float64) are BigQuery-specific and don't map to Snowflake's
+   physical column types after casting via dbt.type_int() / dbt.type_float().
+   This keeps the same _marts.yml schema working for both targets without
+   maintaining two parallel contracts. #}
 {{ config(
     materialized = 'view',
-    contract     = {'enforced': true}
+    contract     = {'enforced': target.type == 'bigquery'}
 ) }}
 
 with
 
 -- Parameterizable anchor date. Default: 12 months ago.
+--
+-- Implementation note (paw-prey-006 fix):
+-- dbt.dateadd compiles to datetime_add(cast(current_date() as datetime), ...)
+-- which returns DATETIME, not DATE. The original COALESCE pattern cast that
+-- DATETIME to STRING ('2025-05-28 00:00:00') and then cast to DATE, but
+-- BigQuery's DATE cast requires strict 'YYYY-MM-DD' format and rejects the
+-- time component — raising "Invalid date: '2025-05-28 00:00:00'" at query
+-- execution time. Fixed with CASE WHEN to avoid the string intermediate:
+-- cast(DATETIME as DATE) truncates the time component in both BQ and Snowflake.
 snapshot_anchor as (
-    select cast(
-        coalesce(
-            nullif('{{ var("snapshot_date", "") }}', ''),
-            cast(date_sub(current_date(), interval 12 month) as string)
-        ) as date
-    ) as snapshot_date
+    select
+        case
+            when nullif('{{ var("snapshot_date", "") }}', '') is not null
+            then cast(nullif('{{ var("snapshot_date", "") }}', '') as date)
+            else cast({{ dbt.dateadd('month', -12, 'current_date()') }} as date)
+        end as snapshot_date
 ),
 
 employees as (
@@ -58,7 +74,12 @@ employees as (
         exit_type,
         job_id,
         performance_tier,
-        compa_ratio
+        compa_ratio,
+        -- birth_date + gender added per paw-prey-005 Story 5.2.2 (rp Epic 1
+        -- preconditions). birth_date enables age_at_window_close downstream;
+        -- gender is the compound-fairness attribute for rp Epic 5.
+        birth_date,
+        gender
     from {{ ref('stg_employees_current') }}
 ),
 
@@ -81,6 +102,36 @@ active_at_snapshot as (
     cross join snapshot_anchor s
     where e.hire_date <= s.snapshot_date
       and (e.exit_date is null or e.exit_date > s.snapshot_date)
+),
+
+-- Survey signals aggregated to employee-snapshot grain (paw-prey-006).
+-- Leakage gate: only include responses with survey_date <= snapshot_date.
+-- Intentionally nullable — employees with no surveys before snapshot_date
+-- get NULL, which is valid signal for Loop 2 missingness analysis.
+-- Coverage expectation: ≥60% of active employees have non-null values
+-- (enforced by dbt_utils.expression_is_true test in _marts.yml).
+survey_signals as (
+    select
+        sr.employee_id,
+        -- Per-employee eNPS: (promoters - detractors) / total × 100, cast INT64.
+        -- CASE WHEN used for cross-dialect boolean-to-int (BQ + Snowflake safe).
+        cast(
+            round(
+                cast(
+                    sum(case when sr.is_promoter  then 1 else 0 end)
+                    - sum(case when sr.is_detractor then 1 else 0 end)
+                as {{ dbt.type_float() }})
+                / nullif(count(*), 0) * 100
+            ) as {{ dbt.type_int() }}
+        ) as enps,
+        -- Average engagement rating across all surveys ≤ snapshot_date.
+        cast(avg(sr.engagement_score)          as {{ dbt.type_float() }}) as engagement_score,
+        -- Average manager relationship rating across all surveys ≤ snapshot_date.
+        cast(avg(sr.manager_relationship_score) as {{ dbt.type_float() }}) as manager_relationship_score
+    from {{ ref('fact_survey_responses') }} sr
+    cross join snapshot_anchor sa
+    where cast(sr.survey_date as date) <= cast(sa.snapshot_date as date)
+    group by sr.employee_id
 )
 
 select
@@ -89,11 +140,39 @@ select
     cast(a.snapshot_date as date) as snapshot_date,
 
     -- ── Features ─────────────────────────────────────────────────────────────
-    cast(date_diff(a.snapshot_date, a.hire_date, month) as int64) as tenure_months,
+    -- date_diff dialect (paw-prey-005 Story 5.6):
+    --   BQ: date_diff(end_date, start_date, part) — END first
+    --   Snowflake: datediff(part, start_date, end_date) — END last
+    -- dbt.datediff signature is (start, end, part) — abstracts both.
+    cast({{ dbt.datediff('a.hire_date', 'a.snapshot_date', 'month') }} as {{ dbt.type_int() }}) as tenure_months,
     cast(a.performance_tier as string) as performance_tier,
-    cast(a.compa_ratio as float64) as compa_ratio,
-    cast(j.is_critical_role as bool) as is_critical_role,
-    cast(coalesce(sp.successor_readiness_count, 0) as int64) as successor_count,
+    cast(a.compa_ratio as {{ dbt.type_float() }}) as compa_ratio,
+    cast(j.is_critical_role as {{ dbt.type_boolean() }}) as is_critical_role,
+    cast(coalesce(sp.successor_readiness_count, 0) as {{ dbt.type_int() }}) as successor_count,
+
+    -- ── Age + demographic features (paw-prey-005 Story 5.2.2) ─────────────
+    -- age_at_window_close = age in completed-ish years at snapshot_date.
+    -- We use ROUND(date_diff(DAY) / 365.25) instead of DATE_DIFF(YEAR) because:
+    --   1) DATE_DIFF(date_a, date_b, YEAR) in BigQuery returns calendar-year
+    --      subtraction (EXTRACT(YEAR FROM a) - EXTRACT(YEAR FROM b)), which
+    --      overcounts by 1 for employees whose birthday hasn't yet passed in
+    --      the snapshot year. ROUND on the day-precise difference avoids that.
+    --   2) The generator built birth_date with the same 365.25 average, so the
+    --      mart's arithmetic mirrors the source — no semantic drift between
+    --      age_at_hire (integer in the source) and age_at_window_close (here).
+    --   3) Snowflake-portability: ROUND + day-difference + 365.25 is the same
+    --      pattern in both dialects (Snowflake uses DATEDIFF(DAY, b, a) — same
+    --      result, different arg order — handled in Story 5.6's port pass).
+    cast(round({{ dbt.datediff('a.birth_date', 'a.snapshot_date', 'day') }} / 365.25) as {{ dbt.type_int() }})
+        as age_at_window_close,
+    cast(a.gender as string) as gender,
+
+    -- ── Survey features (paw-prey-006) ───────────────────────────────────────
+    -- Aggregated over all survey responses ≤ snapshot_date (leakage boundary).
+    -- NULL when no survey responses exist before snapshot_date — valid signal.
+    ss.enps,
+    ss.engagement_score,
+    ss.manager_relationship_score,
 
     -- ── Label ────────────────────────────────────────────────────────────────
     -- TRUE iff the employee voluntarily exited within 12 months AFTER snapshot.
@@ -104,14 +183,15 @@ select
         case
             when a.exit_date is not null
              and a.exit_date >  a.snapshot_date
-             and a.exit_date <= date_add(a.snapshot_date, interval 12 month)
+             and a.exit_date <= {{ dbt.dateadd('month', 12, 'a.snapshot_date') }}
              and a.exit_type =  'term_voluntary'
             then true
             else false
         end
-        as bool
+        as {{ dbt.type_boolean() }}
     ) as voluntary_exit_label
 
 from active_at_snapshot a
 left join jobs j on a.job_id = j.job_id
 left join succession sp on a.employee_id = sp.employee_id
+left join survey_signals ss on a.employee_id = ss.employee_id

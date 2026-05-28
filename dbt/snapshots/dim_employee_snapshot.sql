@@ -28,6 +28,15 @@ select
     hire_date,
     gender,        -- Type 1: static, never NULL (Story 2.1.0)
 
+    -- birth_date + age_at_hire (paw-prey-005 Story 5.2.1) — both immutable
+    -- by definition. A real HR system can correct a wrong DOB, but in this
+    -- synthetic dataset the truth source is the generator's per-employee
+    -- assignment, which never changes. NOT in check_cols (immutable cannot
+    -- generate a "change" event); they ride along on every history row so
+    -- downstream age computations work against any SCD2 version.
+    birth_date,
+    age_at_hire,
+
     -- ── Type 2 attributes — the ones that drive new SCD2 rows ────────────────
     -- job_id: changes on promotion or role change. NOT nullable — no COALESCE.
     job_id,

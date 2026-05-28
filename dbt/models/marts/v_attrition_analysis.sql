@@ -83,17 +83,17 @@ select
 
     -- ── Exit attributes ───────────────────────────────────────────────────────
     t.exit_date,
-    date_trunc(t.exit_date, month)  as exit_month,   -- for monthly decomposition
+    {{ dbt.date_trunc('month', 't.exit_date') }} as exit_month,   -- for monthly decomposition
     t.exit_type,
     t.is_regrettable,
     t.is_voluntary_term,
     t.is_involuntary_term,
 
     -- ── Tenure at exit ────────────────────────────────────────────────────────
-    -- date_diff returns integer days / months between two dates.
+    -- dbt.datediff(start, end, part) — cross-dialect (BQ + Snowflake).
     -- Dividing months by 12.0 gives fractional years — better for scatter axis.
-    date_diff(t.exit_date, e.hire_date, month)           as tenure_months,
-    round(date_diff(t.exit_date, e.hire_date, month) / 12.0, 2) as tenure_years,
+    {{ dbt.datediff('e.hire_date', 't.exit_date', 'month') }}              as tenure_months,
+    round({{ dbt.datediff('e.hire_date', 't.exit_date', 'month') }} / 12.0, 2) as tenure_years,
 
     -- ── Last performance rating before exit ───────────────────────────────────
     -- NULL if the employee had no performance review before exiting.

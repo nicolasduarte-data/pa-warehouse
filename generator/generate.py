@@ -44,7 +44,7 @@ from typing import Final
 import numpy as np
 import pandas as pd
 from faker import Faker
-from scipy.stats import lognorm, norm
+from scipy.stats import lognorm, norm, truncnorm
 from scipy.spatial.distance import jensenshannon
 
 # ─── Loop 1 constants ─────────────────────────────────────────────────
@@ -92,6 +92,40 @@ P_FEMALE_BY_LEVEL: Final[dict[str, float]] = {
     "Director": 0.28,
     "VP+":      0.22,
 }
+
+# ─── Age / birth_date distribution (Story 5.1.2 — paw-prey-005) ───────
+# Truncated normal centred on workforce median age 36 (BLS Current Population
+# Survey 2024, median age of employed civilians ≥16: ~42 nationally; tech
+# companies skew younger — 36 is the calibrated midpoint for this synthetic
+# tech-shaped population). σ=10 captures the spread from early-career (mid-20s)
+# to late-career (50s+); bounds [18, 70] enforce minimum-working-age and
+# pre-retirement ceiling.
+#
+# Sampled as age_at_hire per employee → birth_date is derived from
+# hire_date - age_at_hire. age_at_hire ≥ 18 by construction guarantees the
+# "hire_date - birth_date ≥ 18 years" invariant (Story 5.1.3) — no post-hoc
+# rejection step needed.
+#
+# WHY scipy.stats.truncnorm (not normal + np.clip):
+# A normal draw with manual clipping PILES UP probability mass at the bounds
+# — anyone sampled <18 or >70 collapses onto the boundary, producing a visible
+# spike. truncnorm samples from the properly truncated distribution — no
+# boundary artifact. Distribution-fitting is the whole point of having one.
+#
+# Z-SCORE PARAMETRIZATION (the truncnorm footgun):
+# scipy.stats.truncnorm takes the truncation points (a, b) in STANDARDIZED
+# z-score units, not raw values. To clip raw values at [LOWER, UPPER] with
+# loc=μ, scale=σ:
+#     a = (LOWER - μ) / σ
+#     b = (UPPER - μ) / σ
+# Forgetting this is the most common truncnorm bug — the resulting
+# distribution looks compressed because the actual bounds were too tight.
+AGE_LOC: Final[float]   = 36.0   # workforce median age (BLS CPS 2024, tech-adjusted)
+AGE_SCALE: Final[float] = 10.0   # σ — covers ~95% within ±2σ → [16, 56]
+AGE_MIN: Final[int]     = 18     # minimum working age
+AGE_MAX: Final[int]     = 70     # pre-retirement ceiling
+AGE_A: Final[float]     = (AGE_MIN - AGE_LOC) / AGE_SCALE  # = -1.8 in z-score space
+AGE_B: Final[float]     = (AGE_MAX - AGE_LOC) / AGE_SCALE  # = +3.4 in z-score space
 
 # Log-normal parameters for tenure-at-exit — informed by the synthetic-data
 # methodology research synthesis (May 2026, 20 Tier-1 sources).
@@ -334,6 +368,43 @@ def generate_employees(
         for d in day_offsets
     ]
 
+    # ── Birth date / age_at_hire (Story 5.1.1, 5.1.2, 5.1.4) ──────────────
+    # Sample age_at_hire from a truncated normal, then derive birth_date by
+    # subtracting that many years from hire_date.
+    #
+    # WHY sample age_at_hire (and not birth_date) directly?
+    #   - Workforce age distributions are well-characterised (BLS CPS).
+    #     Birth-date distributions for an active workforce are not — they
+    #     drift with each new cohort's hire dates. Sampling age and deriving
+    #     birth_date keeps the model close to the published demographic shape.
+    #   - age_at_hire ≥ AGE_MIN by construction mechanically guarantees
+    #     hire_date - birth_date ≥ 18 years (Story 5.1.3 invariant) — no
+    #     post-hoc rejection sampling needed.
+    #
+    # PPF-FROM-UNIFORM PATTERN (matches lognorm survival draw below):
+    # Instead of calling truncnorm.rvs(random_state=...), we draw uniform
+    # samples from our own rng and feed them into the inverse CDF (ppf).
+    # This keeps numpy's RNG stream the single source of randomness so
+    # seed reproducibility stays byte-identical across the generator.
+    age_uniform = rng.random(size=n)
+    ages_at_hire_continuous = truncnorm.ppf(
+        age_uniform, a=AGE_A, b=AGE_B, loc=AGE_LOC, scale=AGE_SCALE
+    )
+    # Integer years — half-year birthdays add no analytic value and complicate
+    # downstream age_at_window_close arithmetic on the dbt side.
+    ages_at_hire = ages_at_hire_continuous.round().astype(int)
+
+    # birth_date = hire_date − age_at_hire years.
+    # 365.25 = mean days/year incl. leap years — accurate to within ±1 day,
+    # which is fine for an immutable per-employee birthday derived in the
+    # synthetic layer. Real HR systems store DOB directly; we back-derive it
+    # here because we're constructing the population from demographic
+    # priors, not loading from a system of record.
+    birth_dates = [
+        h - timedelta(days=int(a * 365.25))
+        for h, a in zip(hire_dates, ages_at_hire)
+    ]
+
     # ── Names & emails ────────────────────────────────────────────────────
     first_names = [fake.first_name() for _ in range(n)]
     last_names  = [fake.last_name()  for _ in range(n)]
@@ -439,6 +510,8 @@ def generate_employees(
         "first_name":   first_names,
         "last_name":    last_names,
         "email":        emails,
+        "birth_date":   birth_dates,    # Story 5.1.1 — immutable per-employee DOB
+        "age_at_hire":  ages_at_hire,   # Story 5.1.4 — derived, kept for analytic ergonomics
         "hire_date":    hire_dates,
         "job_id":       job_ids,
         "job_level":    job_levels,   # denormalised for convenience in generator; not in the DB table
@@ -791,6 +864,27 @@ def generate_survey_responses(
                 score = int(rng.integers(7, 9))    # 7 or 8
             else:
                 score = int(rng.integers(0, 7))    # 0 to 6
+            # engagement_score: 1.0–5.0 Likert scale, mean ~3.2 overall.
+            # Positively correlated with perf_tier — disengaged employees
+            # score lower AND are more likely to exit, giving Loop 2's hybrid
+            # cohort meaningful incremental signal beyond eNPS alone.
+            # Calibration: mean = 1.8 + perf_tier * 0.48
+            #   perf=1 → µ≈2.28  perf=3 → µ≈3.24  perf=5 → µ≈4.20
+            engagement_mean = 1.8 + t * 0.48
+            engagement_score = round(
+                float(np.clip(rng.normal(engagement_mean, 0.6), 1.0, 5.0)), 2
+            )
+
+            # manager_relationship_score: 1.0–5.0, mean ~3.2 overall.
+            # Weakly correlated with perf_tier — manager quality is more
+            # org-random than individual performance. Adds noisier signal.
+            # Calibration: mean = 2.75 + perf_tier * 0.15
+            #   perf=1 → µ≈2.90  perf=3 → µ≈3.20  perf=5 → µ≈3.50
+            mgr_mean = 2.75 + t * 0.15
+            manager_relationship_score = round(
+                float(np.clip(rng.normal(mgr_mean, 0.8), 1.0, 5.0)), 2
+            )
+
             rows.append({
                 "survey_id":   f"SRV_{survey_counter:07d}",
                 "employee_id": emp.employee_id,
@@ -802,6 +896,8 @@ def generate_survey_responses(
                     "PASSIVE"   if score >= 7 else
                     "DETRACTOR"
                 ),
+                "engagement_score":          engagement_score,
+                "manager_relationship_score": manager_relationship_score,
             })
             survey_counter += 1
             survey_date = survey_date + pd.DateOffset(months=3)
@@ -1024,6 +1120,45 @@ def validate(employees: pd.DataFrame, events: pd.DataFrame) -> None:
     orphans = set(events["employee_id"]) - set(employees["employee_id"])
     if orphans:
         raise ValueError(f"Validation failure: orphan employee_ids in events: {orphans}")
+
+    # Check 4 (Story 5.1.3 — paw-prey-005): no minor at hire.
+    # The age sampler (truncnorm with AGE_MIN=18) guarantees this by
+    # construction. We layer two checks so any regression in the demographic
+    # path surfaces immediately instead of silently shipping under-age
+    # employees into rp's training data:
+    #
+    #   (a) age_at_hire ≥ AGE_MIN — the SOURCE-of-truth integer. If anyone
+    #       widens the truncnorm bounds or swaps in a non-truncated sampler,
+    #       this catches it directly without going through date arithmetic.
+    #   (b) hire_date - birth_date ≥ int(AGE_MIN * 365.25) days — a sanity
+    #       check that the derived birth_date column wasn't tampered with.
+    #       CRITICAL: the threshold must use the SAME int() floor as the
+    #       construction (`birth_date = hire_date - int(age * 365.25)`);
+    #       otherwise the half-day drift at age=AGE_MIN produces spurious
+    #       failures. Earlier draft used a float threshold and fired on every
+    #       age_at_hire=18 employee — caught by the first full Loop 2 run.
+    if "age_at_hire" in employees.columns:
+        under_age_mask = employees["age_at_hire"] < AGE_MIN
+        if under_age_mask.any():
+            sample = employees.loc[under_age_mask, "employee_id"].head(5).tolist()
+            raise ValueError(
+                f"Validation failure: {int(under_age_mask.sum())} employees have "
+                f"age_at_hire < {AGE_MIN}. First 5: {sample}"
+            )
+
+    if "birth_date" in employees.columns:
+        hire_d  = pd.to_datetime(employees["hire_date"])
+        birth_d = pd.to_datetime(employees["birth_date"])
+        min_gap_days = int(AGE_MIN * 365.25)   # mirror the construction's floor
+        gap_days = (hire_d - birth_d).dt.days
+        inconsistent = employees.loc[gap_days < min_gap_days, "employee_id"]
+        if len(inconsistent) > 0:
+            sample = inconsistent.head(5).tolist()
+            raise ValueError(
+                f"Validation failure: {len(inconsistent)} employees have "
+                f"hire_date - birth_date < {min_gap_days} days "
+                f"(implies age < {AGE_MIN}). First 5: {sample}"
+            )
 
     print(f"  [OK] Validation passed: {len(events)} events for {len(employees)} employees")
 

@@ -107,15 +107,22 @@ def main() -> None:
     # exit_date is nullable (NaN for active/right-censored employees).
     # pd.to_datetime(NaN) returns NaT; .dt.date converts NaT → None, which
     # BigQuery accepts for a nullable DATE column.
+    #
+    # birth_date (paw-prey-005 Story 5.1.1) is REQUIRED — generator guarantees
+    # every employee has one, and downstream age_at_window_close depends on it.
+    # age_at_hire is INT64, [18, 70] enforced at source (truncnorm bounds).
     print("Loading raw.employees ...")
     employees_df = pd.read_csv(DATA_DIR / "employees.csv")
     employees_df = _parse_date(employees_df, "hire_date")
+    employees_df = _parse_date(employees_df, "birth_date")
     employees_df["exit_date"] = pd.to_datetime(employees_df["exit_date"], errors="coerce").dt.date
     employees_schema = [
         bigquery.SchemaField("employee_id", "STRING",  mode="REQUIRED"),
         bigquery.SchemaField("first_name",  "STRING"),
         bigquery.SchemaField("last_name",   "STRING"),
         bigquery.SchemaField("email",       "STRING"),
+        bigquery.SchemaField("birth_date",  "DATE",    mode="REQUIRED"),  # paw-prey-005 5.1.1
+        bigquery.SchemaField("age_at_hire", "INT64",   mode="REQUIRED"),  # paw-prey-005 5.1.4
         bigquery.SchemaField("hire_date",   "DATE"),
         bigquery.SchemaField("job_id",      "STRING"),
         bigquery.SchemaField("gender",      "STRING"),
@@ -186,11 +193,13 @@ def main() -> None:
     survey_df = pd.read_csv(DATA_DIR / "survey_responses.csv")
     survey_df = _parse_date(survey_df, "survey_date")
     survey_schema = [
-        bigquery.SchemaField("survey_id",         "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("employee_id",       "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("survey_date",       "DATE"),
-        bigquery.SchemaField("enps_score",        "INT64"),
-        bigquery.SchemaField("response_category", "STRING"),
+        bigquery.SchemaField("survey_id",                  "STRING",  mode="REQUIRED"),
+        bigquery.SchemaField("employee_id",                "STRING",  mode="REQUIRED"),
+        bigquery.SchemaField("survey_date",                "DATE"),
+        bigquery.SchemaField("enps_score",                 "INT64"),
+        bigquery.SchemaField("response_category",          "STRING"),
+        bigquery.SchemaField("engagement_score",           "FLOAT64"),           # paw-prey-006
+        bigquery.SchemaField("manager_relationship_score", "FLOAT64"),           # paw-prey-006
     ]
     load_table(client, survey_df, "survey_responses", survey_schema)
 
