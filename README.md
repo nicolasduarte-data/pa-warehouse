@@ -26,7 +26,7 @@ Not built: dashboard pages for compa-ratio and pay equity, and writing model pre
 
 ## Stack
 
-- **Warehouse:** BigQuery (primary; billing-enabled free tier; permanent live artifact) + **Snowflake** (validation port, parity-tested)
+- **Warehouse:** BigQuery (primary; live, serving the dashboard from the free sandbox tier) + **Snowflake** (validation port, parity-tested)
 - **Transformation:** dbt-core 1.11 (`dbt-bigquery` primary, `dbt-snowflake` parity target)
 - **BI:** Looker Studio (live BigQuery connector, public read-only)
 - **Generator:** Python 3.11 — `scipy.stats.lognorm` + `scipy.stats.truncnorm` + `faker` + Gaussian copula + CPT
@@ -255,7 +255,7 @@ dbt run --select v_attrition_features --vars '{"snapshot_date": "2025-01-01"}'
 
 **Refresh cadence:** Rebuilt on every `dbt build`. No scheduler: rebuilds run by hand.
 
-**Class balance:** Positive class (voluntary exit within 12 months) typically lands in the 12-25% range depending on snapshot date. Observed 19.19% at `snapshot_date=2025-05-20` (consistent with the dashboard's 2025 voluntary attrition rate of 20.12%). The 36-month-average annual attrition rate is 14.1% per the generator's calibration; short windows in high-attrition years run above that.
+**Class balance:** Positive class (voluntary exit within 12 months) typically lands in the 12-25% range depending on snapshot date. Observed 19.19% at `snapshot_date=2025-05-20` (in line with the dashboard's 2025 voluntary attrition rate of about 20%). The 36-month-average annual attrition rate is 14.1% per the generator's calibration; short windows in high-attrition years run above that.
 
 **Sample query (training data extraction):**
 

@@ -83,7 +83,9 @@ select
 
     -- ── Exit attributes ───────────────────────────────────────────────────────
     t.exit_date,
-    {{ dbt.date_trunc('month', 't.exit_date') }} as exit_month,   -- for monthly decomposition
+    -- Cast to DATE: dbt.date_trunc compiles to timestamp_trunc on BigQuery.
+    -- Month columns stay DATE, like v_workforce_overview.month_start.
+    cast({{ dbt.date_trunc('month', 't.exit_date') }} as date) as exit_month,   -- for monthly decomposition
     t.exit_type,
     t.is_regrettable,
     t.is_voluntary_term,
