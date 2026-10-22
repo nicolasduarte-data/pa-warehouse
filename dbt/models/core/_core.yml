@@ -1,0 +1,353 @@
+version: 2
+
+# ─── Column Mutability Convention ─────────────────────────────────────────────
+# Every column in dim_employee_snapshot AND v_attrition_features carries a
+# `meta.mutability` key with one of four values:
+#
+#   immutable        — value is fixed once set; cannot change for a given
+#                      employee_id. Examples: birth_date, age_at_hire, gender,
+#                      hire_date, employee_id.
+#   slowly_mutable   — value changes infrequently (weeks to months), tracked
+#                      by the SCD2 snapshot. Examples: job_id, dept_id,
+#                      location_id, tenure-derived measures.
+#   mutable          — value changes frequently (daily to monthly) and is
+#                      modelled as point-in-time facts elsewhere. Examples:
+#                      compa_ratio, performance_tier, manager_id, survey
+#                      response counts, successor_count.
+#   label            — applies only to v_attrition_features.voluntary_exit_label.
+#                      The training target — not a feature. Excluded from
+#                      counterfactual perturbation (DiCE).
+#
+# WHY THIS MATTERS — the downstream retention model uses this metadata to:
+#   1) auto-generate the feature catalog — immutable + slowly_mutable
+#      features are stable predictors; mutable features need careful snapshot
+#      alignment to avoid leakage.
+#   2) drive DiCE counterfactual feasibility — DiCE may only perturb
+#      mutable columns when generating "what would have to change" explanations.
+#      Recommending an employee change their birth_date is absurd; recommending
+#      a manager reassignment is actionable.
+#   3) enforce fairness pre-processing — immutable demographic
+#      attributes (birth_date-derived age, gender) are protected attributes and
+#      enter the model under bias-mitigation discipline.
+#
+# CROSS-REFERENCE — the canonical consumer-side spec lives in the
+# retention-prediction repo at docs/integration_contract.md.
+# ──────────────────────────────────────────────────────────────────────────────
+
+models:
+
+  # ── dim_date ───────────────────────────────────────────────────────────────
+  - name: dim_date
+    description: >
+      Calendar dimension covering 2022-01-01 through 2027-12-31. One row per
+      calendar day. Every fact table joins its date column to dim_date.date_day
+      to get month/quarter/year/weekend flags without repeating DATE functions
+      in every query.
+    columns:
+      - name: date_day
+        description: "PK. One row per calendar day."
+        tests:
+          - not_null
+          - unique
+      - name: month_start
+        description: "First day of the month containing date_day."
+        tests:
+          - not_null
+      - name: year
+        description: "Calendar year as integer."
+        tests:
+          - not_null
+
+  # ── dim_department ─────────────────────────────────────────────────────────
+  - name: dim_department
+    description: >
+      One row per department plus one phantom sentinel row ('__NO_DEPT__').
+      Type 1 — no history. The sentinel row allows the SCD2 dim_employee
+      snapshot to COALESCE NULL dept_ids to '__NO_DEPT__' without breaking
+      relationships tests.
+    columns:
+      - name: dept_id
+        description: "PK. Includes '__NO_DEPT__' sentinel."
+        tests:
+          - not_null
+          - unique
+      - name: dept_name
+        description: "Human-readable department name."
+        tests:
+          - not_null
+
+  # ── dim_job ────────────────────────────────────────────────────────────────
+  - name: dim_job
+    description: >
+      One row per job code. Type 1 — no history. Carries criticality,
+      scarcity, band_midpoint, and job_level metadata used across
+      attrition analysis and pay equity pages.
+    columns:
+      - name: job_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: job_level
+        description: "Level code: IC1, IC2, M1, M2, Director, VP+."
+        tests:
+          - not_null
+      - name: is_critical_role
+        description: "True if this role is flagged critical for succession."
+        tests:
+          - not_null
+      - name: band_midpoint
+        description: "Salary midpoint for this job's pay band (USD)."
+        tests:
+          - not_null
+
+  # ── dim_location ───────────────────────────────────────────────────────────
+  - name: dim_location
+    description: >
+      One row per office location plus one phantom sentinel row ('__NO_LOC__').
+      Type 1 — no history. Sentinel mirrors the COALESCE in the SCD2 snapshot
+      for employees in a remote-pending state at hire.
+    columns:
+      - name: location_id
+        description: "PK. Includes '__NO_LOC__' sentinel."
+        tests:
+          - not_null
+          - unique
+      - name: location_name
+        description: "City name or 'Sentinel — source NULL'."
+        tests:
+          - not_null
+      - name: location_type
+        description: "OFFICE / REMOTE / UNKNOWN (sentinel)."
+        tests:
+          - not_null
+
+  # ── fact_workforce_events ──────────────────────────────────────────────────
+  - name: fact_workforce_events
+    description: >
+      One row per workforce event. 2,569 rows: 1,512 hires + 770 voluntary
+      terminations + 287 involuntary terminations. Org context (dept, job,
+      location) from current employee state — appropriate since no mid-employment
+      attribute changes exist in this synthetic dataset.
+    columns:
+      - name: event_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: event_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: event_type
+        description: "hire / term_voluntary / term_involuntary."
+        tests:
+          - not_null
+      - name: is_regrettable
+        description: "CPT-sampled truth label. Meaningful only on term_voluntary rows."
+        tests:
+          - not_null
+
+  # ── fact_compensation_snapshot ────────────────────────────────────────────
+  - name: fact_compensation_snapshot
+    description: >
+      One row per compensation event per employee. 5,609 rows for 2,500 employees
+      (~2.2 comp events each). Includes job_level and band_midpoint from dim_job
+      for pay equity OLS analysis on Page 4.
+    columns:
+      - name: comp_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: effective_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: salary
+        description: "Annual salary in USD."
+        tests:
+          - not_null
+      - name: compa_ratio
+        description: "salary / band_midpoint. Centered at 1.00."
+        tests:
+          - not_null
+
+  # ── fact_performance_ratings ──────────────────────────────────────────────
+  - name: fact_performance_ratings
+    description: >
+      One row per performance review per employee. 7,454 rows: MID (4,344) +
+      YEAR_END (3,110) cycles. Feeds IsRegrettableFlag last-rating-before-term
+      logic and pay equity OLS Spec 3 control variable.
+    columns:
+      - name: rating_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: review_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: performance_rating
+        description: "Ordinal 1–5. 5 = highest."
+        tests:
+          - not_null
+
+  # ── fact_survey_responses ─────────────────────────────────────────────────
+  - name: fact_survey_responses
+    description: >
+      One row per eNPS survey response. 16,095 rows, quarterly cadence.
+      Boolean columns is_promoter / is_detractor / is_passive enable SUM()-based
+      eNPS calculation without nested CASE expressions in downstream models.
+    columns:
+      - name: survey_id
+        description: "PK."
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        description: "FK to stg_employees_current.employee_id."
+        tests:
+          - not_null
+      - name: survey_date
+        description: "FK to dim_date.date_day."
+        tests:
+          - not_null
+      - name: enps_score
+        description: "Raw NPS score 0–10."
+        tests:
+          - not_null
+      - name: response_category
+        description: "PROMOTER / PASSIVE / DETRACTOR."
+        tests:
+          - not_null
+      - name: engagement_score
+        description: "Likert engagement rating 1.0–5.0."
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+      - name: manager_relationship_score
+        description: "Likert manager relationship rating 1.0–5.0."
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1.0
+              max_value: 5.0
+              inclusive: true
+
+# ── dim_employee_snapshot ─────────────────────────────────────────────────────
+# Documented as a snapshot (dbt's first-class type for SCD2). Lives in
+# core.dim_employee_snapshot per the snapshot's target_schema='core' config.
+# The snapshot existed before this entry but was undocumented at the YAML
+# layer.
+snapshots:
+  - name: dim_employee_snapshot
+    description: >
+      SCD2 history of employee org position. One row per (employee_id,
+      validity_window) — new rows are inserted when any check_col changes
+      (dept_id_safe, job_id, manager_id_safe, location_id_safe). Immutable
+      attributes (birth_date, age_at_hire, gender, hire_date, employee_id)
+      ride along on every history row. Mutable attributes that should NOT
+      trigger new history (perf_tier, compa_ratio) are excluded from the
+      snapshot — they're modelled via fact_compensation_snapshot and
+      fact_performance_ratings instead.
+    columns:
+      - name: employee_id
+        description: "Stable business key. The SCD2 snapshot's unique_key."
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+
+      # Type 1 (pass-through) — immutable identity / demographics
+      - name: first_name
+        description: "Synthetic first name (Faker). Type 1 — unchanging."
+        meta:
+          mutability: immutable
+      - name: last_name
+        description: "Synthetic last name (Faker). Type 1 — unchanging."
+        meta:
+          mutability: immutable
+      - name: email
+        description: "first.last.N@example.com. Type 1 — unchanging."
+        meta:
+          mutability: immutable
+      - name: hire_date
+        description: "Date the employee was hired. Type 1 — unchanging."
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+      - name: gender
+        description: "M / F / NB. Type 1 — the generator assigns this conditional on job_level."
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+          - accepted_values:
+              values: [M, F, NB]
+      - name: birth_date
+        description: >
+          Immutable per-employee date of birth.
+          Back-derived in the generator from age_at_hire and hire_date
+          (truncnorm μ=36 σ=10, bounds [18, 70]). Consistent across all SCD2
+          versions of an employee — confirmed by a backfill check during the Snowflake port.
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+      - name: age_at_hire
+        description: >
+          Integer age in years at hire_date.
+          Mutually derivable with birth_date; co-stored for analytic
+          ergonomics. Range [18, 70] enforced at the source.
+        meta:
+          mutability: immutable
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 18
+              max_value: 70
+              inclusive: true
+
+      # Type 2 (check_cols) — drive new history rows
+      - name: job_id
+        description: "FK to dim_job. Type 2 — changes on promotion / role change."
+        meta:
+          mutability: slowly_mutable
+        tests:
+          - not_null
+      - name: dept_id_safe
+        description: "FK to dim_department. NULL coalesced to '__NO_DEPT__'. Type 2 — changes on dept transfer."
+        meta:
+          mutability: slowly_mutable
+        tests:
+          - not_null
+      - name: manager_id_safe
+        description: "FK to dim_employee_snapshot.employee_id. NULL coalesced to '__NO_MGR__'. Type 2 — changes on reassignment."
+        meta:
+          mutability: mutable
+        tests:
+          - not_null
+      - name: location_id_safe
+        description: "FK to dim_location. NULL coalesced to '__NO_LOC__'. Type 2 — changes on office/remote transition."
+        meta:
+          mutability: slowly_mutable
+        tests:
+          - not_null
